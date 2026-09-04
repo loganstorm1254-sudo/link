@@ -444,37 +444,25 @@ def reader_thread(stream, out_q: queue.Queue[str]) -> None:
             pass
 
 
-def run_command(cfg: dict[str, Any]) -> int:
-    cmd = str(cfg.get("command") or DEFAULT_CMD)
-    bot_dir = resolve_bot_dir(cfg.get("bot_dir")) or find_smmod_dir() or Path.cwd()
-    if not bot_dir.is_dir():
-        print(f"[bridge] Bot folder not found: {bot_dir}")
-        sys.exit(1)
-
-    prev = cfg.get("bot_pid")
-    prev_pid = int(prev) if prev else None
-    kill_stale_smmod(bot_dir, prev_pid)
-    # Give Discord a moment to drop the old gateway session
-    time.sleep(1.5)
-
-    print("[bridge] Locating system Python (with discord.py)…")
-    python_exe = resolve_system_python()
-    if python_exe:
-        print(f"[bridge] Using Python: {python_exe}")
-    else:
-        print("[bridge] WARNING: no system Python found — trying raw command")
-
-    try:
-        argv, use_shell = build_bot_argv(cmd, bot_dir, python_exe)
-    except Exception as e:
-        print(f"[bridge] Cannot start bot: {e}")
-        sys.exit(1)
-
-    display = " ".join(argv) if isinstance(argv, list) else str(argv)
-    print(f"[bridge] Bot folder: {bot_dir}")
-    print(f"[bridge] Starting: {display}")
-    print(f"[bridge] Streaming to: {cfg['base_url']}")
-    print("[bridge] Website is view-only. Close this window to stop the bot.\n")
+def run_one_bot(
+    cfg: dict[str, Any],
+    bot_dir: Path,
+    argv: list[str] | str,
+    use_shell: bool,
+    display: str,
+    *,
+    first_start: bool,
+) -> str:
+    """
+    Run smmod once.
+    Returns: "exited" | "stopped" (Ctrl+C stopped bot only)
+    """
+    if not first_start:
+        # Don't wipe site logs on mid-session restarts — only kill leftover PID
+        prev = cfg.get("bot_pid")
+        if prev:
+            kill_pid_tree(int(prev))
+        time.sleep(1.0)
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -482,7 +470,7 @@ def run_command(cfg: dict[str, Any]) -> int:
 
     popen_kwargs: dict[str, Any] = {
         "stdout": subprocess.PIPE,
-        "stderr": subprocess.STDOUT,  # one stream — avoids pipe deadlocks
+        "stderr": subprocess.STDOUT,
         "stdin": subprocess.DEVNULL,
         "bufsize": 0,
         "cwd": str(bot_dir),
@@ -490,17 +478,11 @@ def run_command(cfg: dict[str, Any]) -> int:
         "shell": use_shell,
     }
     if os.name == "nt":
-        # New process group so we can kill the whole tree on exit
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
     proc = subprocess.Popen(argv, **popen_kwargs)
     cfg["bot_pid"] = proc.pid
     save_config(cfg)
-
-    def _cleanup() -> None:
-        kill_pid_tree(proc.pid)
-
-    atexit.register(_cleanup)
 
     q: queue.Queue[str] = queue.Queue()
     threading.Thread(target=reader_thread, args=(proc.stdout, q), daemon=True).start()
@@ -511,12 +493,15 @@ def run_command(cfg: dict[str, Any]) -> int:
     push_lines(
         cfg,
         [
-            f"[bridge] Started PID {proc.pid}",
+            f"[bridge] Started smmod PID {proc.pid}",
             f"[bridge] cwd={bot_dir}",
             f"[bridge] {display}",
+            "[bridge] Ctrl+C stops smmod only — then type start to run again.",
         ],
     )
+    print("[bridge] Running. Ctrl+C = stop smmod only (bridge stays up).\n")
 
+    reason = "exited"
     try:
         while True:
             now = time.time()
@@ -547,26 +532,120 @@ def run_command(cfg: dict[str, Any]) -> int:
                     pass
                 if batch:
                     push_lines(cfg, batch)
-                push_lines(cfg, [f"[bridge] Process exited with code {code}."])
-                cfg["bot_pid"] = None
-                save_config(cfg)
-                return code
+                push_lines(cfg, [f"[bridge] smmod exited with code {code}."])
+                reason = "exited"
+                break
 
             time.sleep(0.05)
     except KeyboardInterrupt:
-        print("\n[bridge] Stopping bot…")
+        print("\n[bridge] Ctrl+C — stopping smmod only…")
         kill_pid_tree(proc.pid)
-        push_lines(cfg, ["[bridge] Bridge stopped by user."])
-        cfg["bot_pid"] = None
-        save_config(cfg)
-        return 130
+        # drain
+        time.sleep(0.2)
+        try:
+            while True:
+                batch.append(q.get_nowait())
+        except queue.Empty:
+            pass
+        if batch:
+            push_lines(cfg, batch)
+        push_lines(cfg, ["[bridge] smmod stopped (Ctrl+C). Bridge still running."])
+        reason = "stopped"
     finally:
         kill_pid_tree(proc.pid)
+        try:
+            if proc.poll() is None:
+                proc.wait(timeout=3)
+        except Exception:
+            pass
         cfg["bot_pid"] = None
         try:
             save_config(cfg)
         except Exception:
             pass
+
+    return reason
+
+
+def wait_for_restart_command() -> str:
+    """
+    After smmod stops: Enter/start = run again, quit/exit = leave bridge.
+    Second Ctrl+C also quits the bridge.
+    """
+    print()
+    print("=" * 56)
+    print("  smmod stopped.")
+    print("  start  /  Enter  → run smmod again")
+    print("  quit             → exit bridge")
+    print("  Ctrl+C           → exit bridge")
+    print("=" * 56)
+    try:
+        line = input("[bridge] > ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\n[bridge] Exiting bridge.")
+        return "quit"
+
+    if line in {"", "start", "s", "run", "r", "restart"}:
+        return "start"
+    if line in {"quit", "q", "exit", "stop"}:
+        return "quit"
+    print(f"[bridge] Unknown command {line!r} — type start or quit.")
+    return wait_for_restart_command()
+
+
+def run_command(cfg: dict[str, Any]) -> int:
+    """
+    Keep the bridge alive. Ctrl+C only kills smmod; then you can `start` again.
+    """
+    cmd = str(cfg.get("command") or DEFAULT_CMD)
+    bot_dir = resolve_bot_dir(cfg.get("bot_dir")) or find_smmod_dir() or Path.cwd()
+    if not bot_dir.is_dir():
+        print(f"[bridge] Bot folder not found: {bot_dir}")
+        sys.exit(1)
+
+    prev = cfg.get("bot_pid")
+    prev_pid = int(prev) if prev else None
+    kill_stale_smmod(bot_dir, prev_pid)
+    time.sleep(1.5)
+
+    print("[bridge] Locating system Python (with discord.py)…")
+    python_exe = resolve_system_python()
+    if python_exe:
+        print(f"[bridge] Using Python: {python_exe}")
+    else:
+        print("[bridge] WARNING: no system Python found — trying raw command")
+
+    try:
+        argv, use_shell = build_bot_argv(cmd, bot_dir, python_exe)
+    except Exception as e:
+        print(f"[bridge] Cannot start bot: {e}")
+        sys.exit(1)
+
+    display = " ".join(argv) if isinstance(argv, list) else str(argv)
+    print(f"[bridge] Bot folder: {bot_dir}")
+    print(f"[bridge] Command: {display}")
+    print(f"[bridge] Streaming to: {cfg['base_url']}")
+    print("[bridge] Ctrl+C stops smmod only. Type start to run it again.\n")
+
+    def _cleanup_atexit() -> None:
+        pid = cfg.get("bot_pid")
+        if pid:
+            kill_pid_tree(int(pid))
+
+    atexit.register(_cleanup_atexit)
+
+    first = True
+    while True:
+        run_one_bot(cfg, bot_dir, argv, use_shell, display, first_start=first)
+        first = False
+        action = wait_for_restart_command()
+        if action == "quit":
+            push_lines(cfg, ["[bridge] Bridge exited."])
+            print("[bridge] Bye.")
+            return 0
+        print("[bridge] Starting smmod again…\n")
+        push_lines(cfg, ["[bridge] Restarting smmod…"])
+        time.sleep(1.0)
 
 
 def main() -> int:
