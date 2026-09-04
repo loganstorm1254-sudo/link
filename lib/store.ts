@@ -22,6 +22,20 @@ export type ConsoleState = {
   claimedAt: number;
 };
 
+/** Durable login from Vercel env (survives cold starts / multiple viewers). */
+export function envCredentials(): { username: string; password: string } | null {
+  const username = (process.env.CONSOLE_USERNAME || "").trim().toLowerCase();
+  const password = process.env.CONSOLE_PASSWORD || "";
+  if (username.length >= 2 && password.length >= 4) {
+    return { username, password };
+  }
+  return null;
+}
+
+export function normalizeUsername(raw: string): string {
+  return String(raw || "").trim().toLowerCase();
+}
+
 type GlobalStore = {
   state: ConsoleState | null;
 };
@@ -123,7 +137,7 @@ export async function claimConsole(opts: {
   newPassword?: string;
   clearLogs?: boolean;
 }): Promise<{ ok: true } | { ok: false; error: string }> {
-  const username = opts.username.trim();
+  const username = normalizeUsername(opts.username);
   const password = opts.password;
   if (username.length < 2 || username.length > 32) {
     return { ok: false, error: "Username must be 2–32 characters." };
@@ -132,10 +146,24 @@ export async function claimConsole(opts: {
     return { ok: false, error: "Password must be 4–128 characters." };
   }
 
+  const env = envCredentials();
+  if (env && (username !== env.username || password !== env.password)) {
+    return {
+      ok: false,
+      error:
+        "Username/password must match CONSOLE_USERNAME + CONSOLE_PASSWORD set on Vercel.",
+    };
+  }
+
   const existing = await loadState();
 
   // Same username + password → refresh claim
-  if (existing && existing.username === username && verifyPassword(password, existing.passwordHash)) {
+  if (
+    existing &&
+    normalizeUsername(existing.username) === username &&
+    verifyPassword(password, existing.passwordHash)
+  ) {
+    existing.username = username;
     existing.lastHeartbeat = Date.now();
     existing.botLabel = opts.botLabel?.trim() || existing.botLabel;
     if (opts.clearLogs) {
@@ -152,6 +180,42 @@ export async function claimConsole(opts: {
     return { ok: true };
   }
 
+  // Env credentials always win — create/replace claim
+  if (env && username === env.username && password === env.password) {
+    const prev = existing;
+    const nextId = prev?.nextId && prev.nextId > 1 ? prev.nextId : 2;
+    const state: ConsoleState = {
+      username,
+      passwordHash: hashPassword(password),
+      salt: "",
+      lines: opts.clearLogs || !prev
+        ? [
+            {
+              id: nextId - 1 > 0 ? nextId - 1 : 1,
+              t: Date.now(),
+              text: `[beacon] Bridge linked as ${username}. Waiting for bot output…`,
+            },
+          ]
+        : prev.lines,
+      nextId: opts.clearLogs || !prev ? nextId : prev.nextId,
+      lastHeartbeat: Date.now(),
+      botLabel: opts.botLabel?.trim() || prev?.botLabel || "smmod",
+      claimedAt: prev?.claimedAt || Date.now(),
+    };
+    if (opts.clearLogs) {
+      state.lines = [
+        {
+          id: (prev?.nextId || 2),
+          t: Date.now(),
+          text: `[beacon] Bridge restarted — old logs wiped.`,
+        },
+      ];
+      state.nextId = (prev?.nextId || 2) + 1;
+    }
+    await saveState(state);
+    return { ok: true };
+  }
+
   // Already claimed by someone else (or wrong password)
   if (existing) {
     const reset = process.env.CONSOLE_RESET_SECRET || "";
@@ -164,7 +228,7 @@ export async function claimConsole(opts: {
       return {
         ok: false,
         error:
-          existing.username === username
+          normalizeUsername(existing.username) === username
             ? "Wrong password."
             : "Console already claimed. Reclaim with the current password and force=true, or CONSOLE_RESET_SECRET.",
       };

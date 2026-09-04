@@ -3,7 +3,14 @@ import {
   authenticateWithPassword,
   verifyAgentBearer,
 } from "../../../lib/auth";
-import { appendLines, loadState } from "../../../lib/store";
+import {
+  appendLines,
+  envCredentials,
+  hashPassword,
+  loadState,
+  normalizeUsername,
+  saveState,
+} from "../../../lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,12 +34,30 @@ export async function POST(req: NextRequest) {
   const bearer = await verifyAgentBearer(req.headers.get("authorization"));
   let ok = false;
   if (bearer) {
-    const state = await loadState();
-    ok = Boolean(state && state.username === bearer.u);
+    let state = await loadState();
+    if (!state || normalizeUsername(state.username) !== bearer.u) {
+      const env = envCredentials();
+      if (env && env.username === bearer.u) {
+        state = {
+          username: env.username,
+          passwordHash: hashPassword(env.password),
+          salt: "",
+          lines: state?.lines || [],
+          nextId: state?.nextId || 1,
+          lastHeartbeat: Date.now(),
+          botLabel: state?.botLabel || "smmod",
+          claimedAt: state?.claimedAt || Date.now(),
+        };
+        await saveState(state);
+      }
+    }
+    state = await loadState();
+    ok = Boolean(state && normalizeUsername(state.username) === bearer.u);
   } else {
     const username = String(body.username || "").trim();
     const password = String(body.password || "");
-    ok = Boolean(await authenticateWithPassword(username, password));
+    const auth = await authenticateWithPassword(username, password);
+    ok = auth.ok;
   }
 
   if (!ok) {

@@ -1,8 +1,12 @@
 import { SignJWT, jwtVerify } from "jose";
 import { cookies } from "next/headers";
 import {
+  envCredentials,
   getSessionCookieName,
+  hashPassword,
   loadState,
+  normalizeUsername,
+  saveState,
   sessionSecret,
   verifyPassword,
   type ConsoleState,
@@ -17,7 +21,7 @@ export async function createSessionToken(
   username: string,
   role: "viewer" | "agent" = "viewer"
 ): Promise<string> {
-  return new SignJWT({ u: username, role })
+  return new SignJWT({ u: normalizeUsername(username), role })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
     .setExpirationTime(role === "agent" ? "30d" : "7d")
@@ -30,7 +34,7 @@ export async function readSession(): Promise<SessionPayload | null> {
   if (!token) return null;
   try {
     const { payload } = await jwtVerify(token, sessionSecret());
-    const u = String(payload.u || "");
+    const u = normalizeUsername(String(payload.u || ""));
     const role = payload.role === "agent" ? "agent" : "viewer";
     if (!u) return null;
     return { u, role };
@@ -47,7 +51,7 @@ export async function verifyAgentBearer(
   if (!token) return null;
   try {
     const { payload } = await jwtVerify(token, sessionSecret());
-    const u = String(payload.u || "");
+    const u = normalizeUsername(String(payload.u || ""));
     if (!u || payload.role !== "agent") return null;
     return { u, role: "agent" };
   } catch {
@@ -55,15 +59,59 @@ export async function verifyAgentBearer(
   }
 }
 
+export type AuthFail = { ok: false; reason: "missing" | "wrong" };
+export type AuthOk = { ok: true; state: ConsoleState };
+
+/**
+ * Validates viewer/agent password.
+ * Prefers durable Vercel env CONSOLE_USERNAME / CONSOLE_PASSWORD when set
+ * (required for multiple people logging in on serverless).
+ */
 export async function authenticateWithPassword(
   username: string,
   password: string
-): Promise<ConsoleState | null> {
+): Promise<AuthOk | AuthFail> {
+  const user = normalizeUsername(username);
+  const env = envCredentials();
+
+  if (env) {
+    if (user !== env.username || password !== env.password) {
+      return { ok: false, reason: "wrong" };
+    }
+    let state = await loadState();
+    if (!state || normalizeUsername(state.username) !== env.username) {
+      state = {
+        username: env.username,
+        passwordHash: hashPassword(env.password),
+        salt: "",
+        lines: state?.lines?.length
+          ? state.lines
+          : [
+              {
+                id: 1,
+                t: Date.now(),
+                text: `[beacon] Waiting for bridge / bot output…`,
+              },
+            ],
+        nextId: state?.nextId || 2,
+        lastHeartbeat: state?.lastHeartbeat || 0,
+        botLabel: state?.botLabel || "smmod",
+        claimedAt: state?.claimedAt || Date.now(),
+      };
+      await saveState(state);
+    }
+    return { ok: true, state };
+  }
+
   const state = await loadState();
-  if (!state) return null;
-  if (state.username !== username.trim()) return null;
-  if (!verifyPassword(password, state.passwordHash)) return null;
-  return state;
+  if (!state) return { ok: false, reason: "missing" };
+  if (normalizeUsername(state.username) !== user) {
+    return { ok: false, reason: "wrong" };
+  }
+  if (!verifyPassword(password, state.passwordHash)) {
+    return { ok: false, reason: "wrong" };
+  }
+  return { ok: true, state };
 }
 
 export function sessionCookieOptions(maxAgeSec: number) {
