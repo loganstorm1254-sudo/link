@@ -2,6 +2,14 @@
 
 Read-only remote console for your Discord bot server PC.
 
+Your bot folder should look like:
+
+```
+smmod/
+  smmod.py
+  (other bot files…)
+```
+
 ## Deploy on Vercel
 
 1. Go to https://vercel.com/new
@@ -13,6 +21,9 @@ Read-only remote console for your Discord bot server PC.
 
 ## PC bridge
 
-Run BeaconConsoleBridge.exe on your server PC, enter the Vercel URL + username/password + `py smmod.py`.
+1. Run BeaconConsoleBridge.exe (or `py bridge.py`)
+2. Enter Vercel URL + username/password
+3. Enter path to your **smmod folder** (the folder that contains `smmod.py`)
+4. Command stays `py smmod.py` (runs inside that folder)
 
 Website is view-only — no typing, no remote shell.

@@ -2,19 +2,21 @@
 """
 Beacon Console Bridge
 ---------------------
-Runs on your server PC. Captures stdout/stderr from smmod.py (or any exe)
-and pushes it to your Vercel console site. View-only on the website —
-no remote typing / no shell access.
+Runs on your server PC. Captures stdout/stderr from your smmod folder
+(smmod/smmod.py or any exe) and pushes it to your Vercel console site.
+View-only on the website — no remote typing / no shell access.
 
 Usage (Windows):
   py bridge.py
-  py bridge.py --cmd "py smmod.py"
+  py bridge.py --bot-dir "C:\\path\\to\\smmod"
+  py bridge.py --cmd "py smmod.py" --bot-dir "D:\\bots\\smmod"
   py bridge.py --cmd "Beacon.exe"
 
 First run asks for:
   - Website URL (https://your-app.vercel.app)
   - Username
   - Password
+  - Path to your smmod folder (the folder that contains smmod.py)
 
 Config is saved next to this script as bridge_config.json
 """
@@ -38,6 +40,35 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "bridge_config.json"
 DEFAULT_CMD = "py smmod.py"
+
+
+def find_smmod_dir() -> Path | None:
+    """Look for a folder named smmod that contains smmod.py."""
+    candidates = [
+        Path.cwd() / "smmod",
+        Path.cwd(),
+        BASE_DIR / "smmod",
+        BASE_DIR.parent / "smmod",
+        BASE_DIR.parent.parent / "smmod",
+    ]
+    # Also walk a couple levels up looking for smmod/smmod.py
+    here = Path.cwd().resolve()
+    for parent in [here, *here.parents[:3]]:
+        candidates.append(parent / "smmod")
+        candidates.append(parent)
+
+    seen: set[Path] = set()
+    for raw in candidates:
+        try:
+            path = raw.resolve()
+        except Exception:
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        if (path / "smmod.py").is_file():
+            return path
+    return None
 
 
 def load_config() -> dict[str, Any]:
@@ -94,6 +125,21 @@ def http_json(
         return 0, {"error": str(e)}
 
 
+def resolve_bot_dir(raw: str | None) -> Path | None:
+    if not raw:
+        return None
+    path = Path(raw.strip().strip('"')).expanduser()
+    try:
+        path = path.resolve()
+    except Exception:
+        return None
+    if path.is_file() and path.name.lower() == "smmod.py":
+        return path.parent
+    if path.is_dir():
+        return path
+    return None
+
+
 def prompt_setup(existing: dict[str, Any]) -> dict[str, Any]:
     print()
     print("=== Beacon Console Bridge ===")
@@ -104,6 +150,8 @@ def prompt_setup(existing: dict[str, Any]) -> dict[str, Any]:
     base = existing.get("base_url") or ""
     user = existing.get("username") or ""
     cmd = existing.get("command") or DEFAULT_CMD
+    detected = find_smmod_dir()
+    bot_dir = existing.get("bot_dir") or (str(detected) if detected else "")
 
     entered = input(f"Website URL [{base or 'https://....vercel.app'}]: ").strip()
     if entered:
@@ -128,7 +176,22 @@ def prompt_setup(existing: dict[str, Any]) -> dict[str, Any]:
             print("Password is required.")
             sys.exit(1)
 
-    entered = input(f"Command to run [{cmd}]: ").strip()
+    print()
+    print("Your bot lives in a folder (example: ...\\smmod\\smmod.py).")
+    hint = bot_dir or r"C:\path\to\smmod"
+    entered = input(f"Path to smmod folder [{hint}]: ").strip().strip('"')
+    if entered:
+        bot_dir = entered
+    resolved = resolve_bot_dir(bot_dir)
+    if not resolved:
+        print("Could not find that folder. Example: C:\\Users\\You\\smmod")
+        sys.exit(1)
+    if not (resolved / "smmod.py").is_file():
+        print(f"Warning: no smmod.py inside {resolved}")
+        print("You can still set a custom command below.")
+    bot_dir = str(resolved)
+
+    entered = input(f"Command to run inside that folder [{cmd}]: ").strip()
     if entered:
         cmd = entered
 
@@ -137,11 +200,13 @@ def prompt_setup(existing: dict[str, Any]) -> dict[str, Any]:
         "username": user,
         "password": password,
         "command": cmd,
+        "bot_dir": bot_dir,
         "bot_label": "smmod",
         "agent_token": existing.get("agent_token") or "",
     }
     save_config(cfg)
     print(f"\nSaved config → {CONFIG_PATH}")
+    print(f"Bot folder   → {bot_dir}")
     return cfg
 
 
@@ -232,11 +297,18 @@ def reader_thread(stream, label: str, out_q: queue.Queue[str]) -> None:
 
 def run_command(cfg: dict[str, Any]) -> int:
     cmd = str(cfg.get("command") or DEFAULT_CMD)
+    bot_dir = resolve_bot_dir(cfg.get("bot_dir")) or find_smmod_dir() or Path.cwd()
+    if not bot_dir.is_dir():
+        print(f"[bridge] Bot folder not found: {bot_dir}")
+        sys.exit(1)
+
+    print(f"[bridge] Bot folder: {bot_dir}")
     print(f"[bridge] Starting: {cmd}")
     print(f"[bridge] Streaming to: {cfg['base_url']}")
     print("[bridge] Website is view-only. Close this window to stop.\n")
 
     # shell=True so Windows users can pass "py smmod.py" or paths with spaces
+    # cwd = smmod folder so relative files next to smmod.py still work
     creationflags = 0
     if os.name == "nt":
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -249,7 +321,7 @@ def run_command(cfg: dict[str, Any]) -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
-        cwd=str(Path.cwd()),
+        cwd=str(bot_dir),
     )
 
     q: queue.Queue[str] = queue.Queue()
@@ -263,7 +335,7 @@ def run_command(cfg: dict[str, Any]) -> int:
     batch: list[str] = []
     last_push = 0.0
     last_beat = 0.0
-    push_lines(cfg, [f"[bridge] Connected. Running: {cmd}"])
+    push_lines(cfg, [f"[bridge] Connected. cwd={bot_dir} · {cmd}"])
 
     try:
         while True:
@@ -324,7 +396,12 @@ def main() -> int:
         "--cmd",
         dest="command",
         default=None,
-        help='Command to run, e.g. "py smmod.py" or path to .exe',
+        help='Command to run inside the smmod folder, e.g. "py smmod.py"',
+    )
+    parser.add_argument(
+        "--bot-dir",
+        default=None,
+        help=r'Folder that contains smmod.py, e.g. "C:\bots\smmod"',
     )
     parser.add_argument(
         "--url",
@@ -350,6 +427,7 @@ def main() -> int:
         or not cfg.get("base_url")
         or not cfg.get("username")
         or not cfg.get("password")
+        or not cfg.get("bot_dir")
     )
 
     if need_setup and not (args.url and args.user and args.password):
@@ -363,13 +441,26 @@ def main() -> int:
             cfg["password"] = args.password
         if args.command:
             cfg["command"] = args.command
+        if args.bot_dir:
+            resolved = resolve_bot_dir(args.bot_dir)
+            if resolved:
+                cfg["bot_dir"] = str(resolved)
         cfg.setdefault("command", DEFAULT_CMD)
         cfg.setdefault("bot_label", "smmod")
+        if not cfg.get("bot_dir"):
+            detected = find_smmod_dir()
+            if detected:
+                cfg["bot_dir"] = str(detected)
         save_config(cfg)
 
     if args.command:
         cfg["command"] = args.command
         save_config(cfg)
+    if args.bot_dir:
+        resolved = resolve_bot_dir(args.bot_dir)
+        if resolved:
+            cfg["bot_dir"] = str(resolved)
+            save_config(cfg)
 
     claim(cfg)
 
