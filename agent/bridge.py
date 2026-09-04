@@ -24,9 +24,11 @@ Config is saved next to this script as bridge_config.json
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -39,7 +41,7 @@ from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "bridge_config.json"
-DEFAULT_CMD = "py smmod.py"
+DEFAULT_CMD = "smmod.py"  # resolved to: <system-python> -u smmod.py
 
 
 def find_smmod_dir() -> Path | None:
@@ -69,6 +71,147 @@ def find_smmod_dir() -> Path | None:
         if (path / "smmod.py").is_file():
             return path
     return None
+
+
+def resolve_system_python() -> str | None:
+    """
+    Find the real Windows Python that has discord.py — NOT the embeddable
+    interpreter that ships inside BeaconConsoleBridge.exe.
+    Avoid bare `py` with pipes (launcher can spawn a child and break stdio).
+    """
+    # If we're already on a normal install (not embeddable pack), prefer it
+    # only when discord is importable — bridge pack python usually isn't.
+    candidates: list[str] = []
+
+    # Ask the py launcher for the real executable path (no pipes to the bot)
+    for args in (
+        ["py", "-3", "-c", "import sys; print(sys.executable)"],
+        ["py", "-c", "import sys; print(sys.executable)"],
+        ["python", "-c", "import sys; print(sys.executable)"],
+        ["python3", "-c", "import sys; print(sys.executable)"],
+    ):
+        try:
+            out = subprocess.check_output(
+                args,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=8,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+            ).strip()
+            if out and Path(out).is_file():
+                # Skip our own embeddable python folder
+                if "BeaconConsoleBridge" in out.replace("\\", "/"):
+                    continue
+                if (BASE_DIR.parent / "python").resolve() in Path(out).resolve().parents:
+                    continue
+                candidates.append(out)
+        except Exception:
+            continue
+
+    # which() fallbacks
+    for name in ("python", "python3"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+
+    seen: set[str] = set()
+    for exe in candidates:
+        key = str(Path(exe).resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        # Prefer one that can import discord
+        try:
+            subprocess.check_output(
+                [exe, "-c", "import discord; print('ok')"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+            )
+            return exe
+        except Exception:
+            continue
+
+    # Last resort: any resolved interpreter
+    return candidates[0] if candidates else None
+
+
+def kill_pid_tree(pid: int) -> None:
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            os.kill(pid, 15)
+        except Exception:
+            pass
+
+
+def kill_stale_smmod(bot_dir: Path, previous_pid: int | None = None) -> None:
+    """Stop leftover smmod.py processes so Discord token isn't shared."""
+    if previous_pid:
+        print(f"[bridge] Stopping previous bot PID {previous_pid}…")
+        kill_pid_tree(previous_pid)
+
+    if os.name != "nt":
+        return
+
+    # Kill any python still running smmod.py (common after closing the bridge window)
+    try:
+        ps = (
+            "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.CommandLine -and ($_.CommandLine -match 'smmod\\.py') } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        pass
+
+
+def build_bot_argv(cmd: str, bot_dir: Path, python_exe: str | None) -> tuple[list[str] | str, bool]:
+    """
+    Returns (argv_or_cmdline, use_shell).
+    Default smmod launch → real python -u smmod.py (no shell, no py launcher).
+    """
+    raw = (cmd or "").strip()
+    lowered = raw.lower()
+
+    # Treat common defaults as "run smmod.py properly"
+    if (
+        not raw
+        or lowered in {"smmod.py", "py smmod.py", "python smmod.py", "python3 smmod.py", "py -u smmod.py"}
+        or lowered.replace(" ", "") in {"pysmod.py", "python-usmod.py"}
+    ):
+        script = bot_dir / "smmod.py"
+        if not script.is_file():
+            raise FileNotFoundError(f"smmod.py not found in {bot_dir}")
+        if not python_exe:
+            raise RuntimeError(
+                "Could not find a system Python with discord.py. "
+                "Install Python from python.org and `pip install discord.py`, "
+                "then re-run the bridge."
+            )
+        return [python_exe, "-u", str(script)], False
+
+    # Custom command — still prefer shell for exe paths / complex cmds
+    return raw, True
 
 
 def load_config() -> dict[str, Any]:
@@ -150,6 +293,8 @@ def prompt_setup(existing: dict[str, Any]) -> dict[str, Any]:
     base = existing.get("base_url") or ""
     user = existing.get("username") or ""
     cmd = existing.get("command") or DEFAULT_CMD
+    if str(cmd).strip().lower() in {"py smmod.py", "python smmod.py", "python3 smmod.py"}:
+        cmd = DEFAULT_CMD
     detected = find_smmod_dir()
     bot_dir = existing.get("bot_dir") or (str(detected) if detected else "")
 
@@ -194,6 +339,9 @@ def prompt_setup(existing: dict[str, Any]) -> dict[str, Any]:
     entered = input(f"Command to run inside that folder [{cmd}]: ").strip()
     if entered:
         cmd = entered
+    # Normalize old default so we use real python -u launch
+    if cmd.strip().lower() in {"py smmod.py", "python smmod.py", "python3 smmod.py"}:
+        cmd = DEFAULT_CMD
 
     cfg = {
         "base_url": base,
@@ -219,6 +367,7 @@ def claim(cfg: dict[str, Any], force: bool = False) -> str:
             "password": cfg["password"],
             "botLabel": cfg.get("bot_label") or "smmod",
             "force": force,
+            "clearLogs": True,  # wipe site console on every bridge start
         },
     )
     if status != 200 or not data.get("ok"):
@@ -235,7 +384,7 @@ def claim(cfg: dict[str, Any], force: bool = False) -> str:
         sys.exit(1)
     cfg["agent_token"] = token
     save_config(cfg)
-    print("[bridge] Console claimed on Vercel.")
+    print("[bridge] Console claimed on Vercel (old logs wiped).")
     return token
 
 
@@ -270,7 +419,7 @@ def heartbeat(cfg: dict[str, Any]) -> None:
     )
 
 
-def reader_thread(stream, label: str, out_q: queue.Queue[str]) -> None:
+def reader_thread(stream, out_q: queue.Queue[str]) -> None:
     try:
         for raw in iter(stream.readline, b""):
             try:
@@ -280,7 +429,8 @@ def reader_thread(stream, label: str, out_q: queue.Queue[str]) -> None:
             text = text.replace("\r\n", "\n").replace("\r", "\n")
             if text.endswith("\n"):
                 text = text[:-1]
-            # Still print locally so the CMD window looks normal
+            if text == "":
+                continue
             try:
                 sys.stdout.write(text + "\n")
                 sys.stdout.flush()
@@ -292,7 +442,6 @@ def reader_thread(stream, label: str, out_q: queue.Queue[str]) -> None:
             stream.close()
         except Exception:
             pass
-        out_q.put(f"[bridge] ({label} closed)")
 
 
 def run_command(cfg: dict[str, Any]) -> int:
@@ -302,40 +451,71 @@ def run_command(cfg: dict[str, Any]) -> int:
         print(f"[bridge] Bot folder not found: {bot_dir}")
         sys.exit(1)
 
+    prev = cfg.get("bot_pid")
+    prev_pid = int(prev) if prev else None
+    kill_stale_smmod(bot_dir, prev_pid)
+    # Give Discord a moment to drop the old gateway session
+    time.sleep(1.5)
+
+    print("[bridge] Locating system Python (with discord.py)…")
+    python_exe = resolve_system_python()
+    if python_exe:
+        print(f"[bridge] Using Python: {python_exe}")
+    else:
+        print("[bridge] WARNING: no system Python found — trying raw command")
+
+    try:
+        argv, use_shell = build_bot_argv(cmd, bot_dir, python_exe)
+    except Exception as e:
+        print(f"[bridge] Cannot start bot: {e}")
+        sys.exit(1)
+
+    display = " ".join(argv) if isinstance(argv, list) else str(argv)
     print(f"[bridge] Bot folder: {bot_dir}")
-    print(f"[bridge] Starting: {cmd}")
+    print(f"[bridge] Starting: {display}")
     print(f"[bridge] Streaming to: {cfg['base_url']}")
-    print("[bridge] Website is view-only. Close this window to stop.\n")
+    print("[bridge] Website is view-only. Close this window to stop the bot.\n")
 
-    # shell=True so Windows users can pass "py smmod.py" or paths with spaces
-    # cwd = smmod folder so relative files next to smmod.py still work
-    creationflags = 0
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,  # one stream — avoids pipe deadlocks
+        "stdin": subprocess.DEVNULL,
+        "bufsize": 0,
+        "cwd": str(bot_dir),
+        "env": env,
+        "shell": use_shell,
+    }
     if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        # Keep a visible console — do NOT hide the window; user wants CMD output
-        creationflags = 0
+        # New process group so we can kill the whole tree on exit
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
-    proc = subprocess.Popen(
-        cmd,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
-        cwd=str(bot_dir),
-    )
+    proc = subprocess.Popen(argv, **popen_kwargs)
+    cfg["bot_pid"] = proc.pid
+    save_config(cfg)
+
+    def _cleanup() -> None:
+        kill_pid_tree(proc.pid)
+
+    atexit.register(_cleanup)
 
     q: queue.Queue[str] = queue.Queue()
-    threading.Thread(
-        target=reader_thread, args=(proc.stdout, "stdout", q), daemon=True
-    ).start()
-    threading.Thread(
-        target=reader_thread, args=(proc.stderr, "stderr", q), daemon=True
-    ).start()
+    threading.Thread(target=reader_thread, args=(proc.stdout, q), daemon=True).start()
 
     batch: list[str] = []
     last_push = 0.0
     last_beat = 0.0
-    push_lines(cfg, [f"[bridge] Connected. cwd={bot_dir} · {cmd}"])
+    push_lines(
+        cfg,
+        [
+            f"[bridge] Started PID {proc.pid}",
+            f"[bridge] cwd={bot_dir}",
+            f"[bridge] {display}",
+        ],
+    )
 
     try:
         while True:
@@ -359,7 +539,6 @@ def run_command(cfg: dict[str, Any]) -> int:
 
             code = proc.poll()
             if code is not None:
-                # drain remaining
                 time.sleep(0.2)
                 try:
                     while True:
@@ -368,21 +547,26 @@ def run_command(cfg: dict[str, Any]) -> int:
                     pass
                 if batch:
                     push_lines(cfg, batch)
-                push_lines(
-                    cfg,
-                    [f"[bridge] Process exited with code {code}."],
-                )
+                push_lines(cfg, [f"[bridge] Process exited with code {code}."])
+                cfg["bot_pid"] = None
+                save_config(cfg)
                 return code
 
             time.sleep(0.05)
     except KeyboardInterrupt:
-        print("\n[bridge] Stopping…")
+        print("\n[bridge] Stopping bot…")
+        kill_pid_tree(proc.pid)
+        push_lines(cfg, ["[bridge] Bridge stopped by user."])
+        cfg["bot_pid"] = None
+        save_config(cfg)
+        return 130
+    finally:
+        kill_pid_tree(proc.pid)
+        cfg["bot_pid"] = None
         try:
-            proc.terminate()
+            save_config(cfg)
         except Exception:
             pass
-        push_lines(cfg, ["[bridge] Bridge stopped by user."])
-        return 130
 
 
 def main() -> int:

@@ -15,6 +15,7 @@ export async function POST(req: NextRequest) {
     password?: string;
     botLabel?: string;
     force?: boolean;
+    clearLogs?: boolean;
   };
   try {
     body = await req.json();
@@ -29,6 +30,7 @@ export async function POST(req: NextRequest) {
     password,
     botLabel: body.botLabel,
     force: Boolean(body.force),
+    clearLogs: body.clearLogs !== false, // default wipe on bridge claim
   });
 
   if (!result.ok) {

@@ -35,8 +35,14 @@ export default function ConsolePage() {
         setUsername(data.username || "");
         if (Array.isArray(data.lines) && data.lines.length) {
           setLines((prev) => {
-            const merged =
-              afterRef.current === 0 ? data.lines : [...prev, ...data.lines];
+            const wiped = data.lines.some((l: LogLine) =>
+              String(l.text).includes("old logs wiped")
+            );
+            const merged = wiped
+              ? data.lines
+              : afterRef.current === 0
+                ? data.lines
+                : [...prev, ...data.lines];
             const last = merged[merged.length - 1];
             if (last) afterRef.current = last.id;
             return merged.slice(-2000);

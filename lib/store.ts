@@ -121,6 +121,7 @@ export async function claimConsole(opts: {
   botLabel?: string;
   force?: boolean;
   newPassword?: string;
+  clearLogs?: boolean;
 }): Promise<{ ok: true } | { ok: false; error: string }> {
   const username = opts.username.trim();
   const password = opts.password;
@@ -133,10 +134,20 @@ export async function claimConsole(opts: {
 
   const existing = await loadState();
 
-  // Same username + password → refresh claim (keep log history)
+  // Same username + password → refresh claim
   if (existing && existing.username === username && verifyPassword(password, existing.passwordHash)) {
     existing.lastHeartbeat = Date.now();
     existing.botLabel = opts.botLabel?.trim() || existing.botLabel;
+    if (opts.clearLogs) {
+      // Keep nextId monotonic so browser cursors still work
+      existing.lines = [
+        {
+          id: existing.nextId++,
+          t: Date.now(),
+          text: `[beacon] Bridge restarted — old logs wiped.`,
+        },
+      ];
+    }
     await saveState(existing);
     return { ok: true };
   }
