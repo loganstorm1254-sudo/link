@@ -40,8 +40,94 @@ from pathlib import Path
 from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = BASE_DIR / "bridge_config.json"
+# Config next to the .exe pack root when running from BeaconConsoleBridge-Windows
+_PACK_ROOT = BASE_DIR.parent if (BASE_DIR.parent / "python").is_dir() else BASE_DIR
+CONFIG_PATH = _PACK_ROOT / "bridge_config.json"
 DEFAULT_CMD = "smmod.py"  # resolved to: <system-python> -u smmod.py
+
+
+def pause_before_close(msg: str = "") -> None:
+    """Keep the window open so double-click launches show errors."""
+    if msg:
+        print(msg)
+    try:
+        input("\nPress Enter to close…")
+    except Exception:
+        time.sleep(12)
+
+
+def fix_windows_path() -> None:
+    """
+    Double-clicking the .exe often has a tiny PATH (no `py` / `python`).
+    Merge the real User + Machine PATH from the registry.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import winreg
+
+        chunks: list[str] = []
+        for root, sub in (
+            (winreg.HKEY_CURRENT_USER, r"Environment"),
+            (
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            ),
+        ):
+            try:
+                with winreg.OpenKey(root, sub) as key:
+                    val, _ = winreg.QueryValueEx(key, "Path")
+                    if val:
+                        chunks.append(str(val))
+            except OSError:
+                pass
+        current = os.environ.get("PATH", "")
+        merged = os.pathsep.join([*chunks, current])
+        # Expand %VARS%
+        os.environ["PATH"] = os.path.expandvars(merged)
+    except Exception:
+        pass
+
+
+def iter_common_python_exes() -> list[str]:
+    homes = [
+        os.environ.get("LOCALAPPDATA", ""),
+        os.environ.get("PROGRAMFILES", ""),
+        os.environ.get("PROGRAMFILES(X86)", ""),
+        r"C:\\",
+    ]
+    versions = ["314", "313", "312", "311", "310", "39", "38"]
+    found: list[str] = []
+    for home in homes:
+        if not home:
+            continue
+        for ver in versions:
+            candidates = [
+                Path(home) / "Programs" / "Python" / f"Python{ver}" / "python.exe",
+                Path(home) / f"Python{ver}" / "python.exe",
+                Path(home) / "Python" / f"Python{ver}" / "python.exe",
+            ]
+            for c in candidates:
+                try:
+                    if c.is_file():
+                        found.append(str(c.resolve()))
+                except Exception:
+                    pass
+    # py.exe launcher locations
+    for c in (
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "py.exe",
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Programs"
+        / "Python"
+        / "Launcher"
+        / "py.exe",
+    ):
+        try:
+            if c.is_file():
+                found.append(str(c.resolve()))
+        except Exception:
+            pass
+    return found
 
 
 def find_smmod_dir() -> Path | None:
@@ -79,62 +165,89 @@ def resolve_system_python() -> str | None:
     interpreter that ships inside BeaconConsoleBridge.exe.
     Avoid bare `py` with pipes (launcher can spawn a child and break stdio).
     """
-    # If we're already on a normal install (not embeddable pack), prefer it
-    # only when discord is importable — bridge pack python usually isn't.
+    fix_windows_path()
     candidates: list[str] = []
 
     # Ask the py launcher for the real executable path (no pipes to the bot)
-    for args in (
-        ["py", "-3", "-c", "import sys; print(sys.executable)"],
-        ["py", "-c", "import sys; print(sys.executable)"],
-        ["python", "-c", "import sys; print(sys.executable)"],
-        ["python3", "-c", "import sys; print(sys.executable)"],
-    ):
-        try:
-            out = subprocess.check_output(
-                args,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=8,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
-            ).strip()
-            if out and Path(out).is_file():
-                # Skip our own embeddable python folder
-                if "BeaconConsoleBridge" in out.replace("\\", "/"):
-                    continue
-                if (BASE_DIR.parent / "python").resolve() in Path(out).resolve().parents:
-                    continue
-                candidates.append(out)
-        except Exception:
+    launchers = ["py", "python", "python3", *iter_common_python_exes()]
+    # De-dupe while preserving order
+    seen_l: set[str] = set()
+    ordered: list[str] = []
+    for item in launchers:
+        key = item.lower()
+        if key in seen_l:
             continue
+        seen_l.add(key)
+        ordered.append(item)
 
-    # which() fallbacks
+    for launcher in ordered:
+        if launcher.lower().endswith("python.exe"):
+            candidates.append(launcher)
+            continue
+        for args in (
+            [launcher, "-3", "-c", "import sys; print(sys.executable)"],
+            [launcher, "-c", "import sys; print(sys.executable)"],
+        ):
+            try:
+                out = subprocess.check_output(
+                    args,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=8,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    if os.name == "nt"
+                    else 0,
+                ).strip()
+                if out and Path(out).is_file():
+                    if "BeaconConsoleBridge" in out.replace("\\", "/"):
+                        continue
+                    if (_PACK_ROOT / "python").resolve() in Path(out).resolve().parents:
+                        continue
+                    candidates.append(out)
+                    break
+            except Exception:
+                continue
+
     for name in ("python", "python3"):
         found = shutil.which(name)
         if found:
             candidates.append(found)
 
     seen: set[str] = set()
+    unique: list[str] = []
     for exe in candidates:
-        key = str(Path(exe).resolve()).lower()
+        try:
+            key = str(Path(exe).resolve()).lower()
+        except Exception:
+            key = exe.lower()
         if key in seen:
             continue
+        # Never use the pack's embeddable interpreter to run the bot
+        if "beaconconsolebridge" in key.replace("\\", "/"):
+            continue
+        if str((_PACK_ROOT / "python").resolve()).lower() in key:
+            continue
         seen.add(key)
-        # Prefer one that can import discord
+        unique.append(exe)
+
+    # Prefer one that can import discord
+    for exe in unique:
         try:
             subprocess.check_output(
                 [exe, "-c", "import discord; print('ok')"],
                 stderr=subprocess.DEVNULL,
                 text=True,
-                timeout=10,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+                timeout=12,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                if os.name == "nt"
+                else 0,
             )
             return exe
         except Exception:
             continue
 
-    # Last resort: any resolved interpreter
-    return candidates[0] if candidates else None
+    # Last resort: any resolved interpreter (bot may still fail on missing deps)
+    return unique[0] if unique else None
 
 
 def kill_pid_tree(pid: int) -> None:
@@ -847,4 +960,23 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import traceback
+
+    fix_windows_path()
+    code: int | None = 0
+    try:
+        code = main()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+        if code != 0:
+            pause_before_close()
+        raise SystemExit(code)
+    except Exception:
+        print("\n[bridge] CRASH:")
+        traceback.print_exc()
+        pause_before_close()
+        raise SystemExit(1)
+
+    if code not in (0, None):
+        pause_before_close(f"[bridge] Exited with code {code}")
+    raise SystemExit(code or 0)
