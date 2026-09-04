@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { useRouter } from "next/navigation";
 
 type LogLine = { id: number; t: number; text: string };
@@ -9,6 +9,10 @@ export default function ConsolePage() {
   const router = useRouter();
   const [lines, setLines] = useState<LogLine[]>([]);
   const [online, setOnline] = useState(false);
+  const [botRunning, setBotRunning] = useState(false);
+  const [pending, setPending] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [controlMsg, setControlMsg] = useState("");
   const [botLabel, setBotLabel] = useState("smmod");
   const [username, setUsername] = useState("");
   const afterRef = useRef(0);
@@ -31,6 +35,8 @@ export default function ConsolePage() {
         const data = await res.json();
         if (cancelled) return;
         setOnline(Boolean(data.online));
+        setBotRunning(Boolean(data.botRunning));
+        setPending(data.pendingCommand?.action || null);
         setBotLabel(data.botLabel || "smmod");
         setUsername(data.username || "");
         if (Array.isArray(data.lines) && data.lines.length) {
@@ -72,6 +78,34 @@ export default function ConsolePage() {
     router.replace("/");
   }
 
+  async function sendControl(action: "start" | "stop") {
+    setBusy(true);
+    setControlMsg("");
+    try {
+      const res = await fetch("/api/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setControlMsg(data.error || "Failed");
+      } else {
+        setControlMsg(`Sent ${action} — waiting for PC…`);
+        setPending(action);
+      }
+    } catch {
+      setControlMsg("Could not reach server.");
+    }
+    setBusy(false);
+  }
+
+  const statusLabel = !online
+    ? "BRIDGE OFFLINE"
+    : botRunning
+      ? "BOT RUNNING"
+      : "BOT STOPPED";
+
   return (
     <main
       style={{
@@ -93,6 +127,7 @@ export default function ConsolePage() {
           borderBottom: "1px solid var(--line)",
           background: "rgba(5,8,6,0.82)",
           backdropFilter: "blur(8px)",
+          flexWrap: "wrap",
         }}
       >
         <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
@@ -107,18 +142,30 @@ export default function ConsolePage() {
             BEACON
           </strong>
           <span style={{ color: "var(--muted)", fontSize: "0.78rem" }}>
-            {botLabel}.py · view only
+            {botLabel}.py
           </span>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "0.9rem" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "0.65rem",
+            flexWrap: "wrap",
+          }}
+        >
           <span
             style={{
               display: "inline-flex",
               alignItems: "center",
               gap: "0.45rem",
-              fontSize: "0.75rem",
-              color: online ? "var(--phosphor)" : "var(--danger)",
+              fontSize: "0.72rem",
+              color:
+                !online
+                  ? "var(--danger)"
+                  : botRunning
+                    ? "var(--phosphor)"
+                    : "var(--amber)",
               letterSpacing: "0.06em",
             }}
           >
@@ -127,12 +174,35 @@ export default function ConsolePage() {
                 width: 8,
                 height: 8,
                 borderRadius: "50%",
-                background: online ? "var(--phosphor)" : "var(--danger)",
-                animation: online ? "pulse-dot 1.6s infinite" : undefined,
+                background:
+                  !online
+                    ? "var(--danger)"
+                    : botRunning
+                      ? "var(--phosphor)"
+                      : "var(--amber)",
+                animation: botRunning ? "pulse-dot 1.6s infinite" : undefined,
               }}
             />
-            {online ? "LIVE" : "OFFLINE"}
+            {statusLabel}
           </span>
+
+          <button
+            type="button"
+            disabled={busy || !online || botRunning || pending === "start"}
+            onClick={() => sendControl("start")}
+            style={btnStyle(true, busy || !online || botRunning)}
+          >
+            Start
+          </button>
+          <button
+            type="button"
+            disabled={busy || !online || !botRunning || pending === "stop"}
+            onClick={() => sendControl("stop")}
+            style={btnStyle(false, busy || !online || !botRunning)}
+          >
+            Stop
+          </button>
+
           <span style={{ color: "var(--muted)", fontSize: "0.75rem" }}>
             {username}
           </span>
@@ -152,6 +222,20 @@ export default function ConsolePage() {
           </button>
         </div>
       </header>
+
+      {controlMsg ? (
+        <div
+          style={{
+            padding: "0.4rem 1.1rem",
+            fontSize: "0.75rem",
+            color: "var(--amber)",
+            borderBottom: "1px solid var(--line)",
+          }}
+        >
+          {controlMsg}
+          {pending ? ` (pending: ${pending})` : ""}
+        </div>
+      ) : null}
 
       <div
         ref={scrollerRef}
@@ -218,11 +302,31 @@ export default function ConsolePage() {
           background: "rgba(5,8,6,0.9)",
         }}
       >
-        <span>Read-only mirror · no input · no remote shell</span>
+        <span>Start / Stop smmod on the PC · no shell / no free typing</span>
         <span>{lines.length} lines</span>
       </footer>
     </main>
   );
+}
+
+function btnStyle(isStart: boolean, disabled: boolean): CSSProperties {
+  const color = isStart ? "var(--phosphor)" : "var(--danger)";
+  return {
+    border: `1px solid ${color}`,
+    background: disabled
+      ? "transparent"
+      : isStart
+        ? "rgba(61,255,122,0.12)"
+        : "rgba(255,92,92,0.12)",
+    color,
+    padding: "0.4rem 0.85rem",
+    cursor: disabled ? "not-allowed" : "pointer",
+    fontSize: "0.75rem",
+    fontWeight: 600,
+    letterSpacing: "0.06em",
+    textTransform: "uppercase",
+    opacity: disabled ? 0.4 : 1,
+  };
 }
 
 function colorFor(text: string): string {
@@ -230,7 +334,9 @@ function colorFor(text: string): string {
   if (t.includes("error") || t.includes("traceback") || t.includes("exception")) {
     return "var(--danger)";
   }
-  if (t.includes("warn")) return "var(--amber)";
+  if (t.includes("warn") || t.includes("remote stop") || t.includes("remote start")) {
+    return "var(--amber)";
+  }
   if (t.startsWith("[beacon]")) return "var(--phosphor-dim)";
   return "var(--text)";
 }

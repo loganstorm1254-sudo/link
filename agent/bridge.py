@@ -409,14 +409,60 @@ def push_lines(cfg: dict[str, Any], lines: list[str]) -> bool:
     return status == 200 and bool(data.get("ok"))
 
 
-def heartbeat(cfg: dict[str, Any]) -> None:
+def heartbeat(cfg: dict[str, Any], bot_running: bool = False) -> None:
     http_json(
         "POST",
         f"{cfg['base_url']}/api/heartbeat",
-        {"botLabel": cfg.get("bot_label") or "smmod"},
+        {
+            "botLabel": cfg.get("bot_label") or "smmod",
+            "botRunning": bool(bot_running),
+        },
         token=cfg.get("agent_token") or None,
         timeout=10.0,
     )
+
+
+def poll_remote_command(cfg: dict[str, Any]) -> str | None:
+    """Pull one pending start/stop from the website (clears it server-side)."""
+    status, data = http_json(
+        "GET",
+        f"{cfg['base_url']}/api/control",
+        token=cfg.get("agent_token") or None,
+        timeout=10.0,
+    )
+    if status == 401:
+        claim(cfg)
+        status, data = http_json(
+            "GET",
+            f"{cfg['base_url']}/api/control",
+            token=cfg.get("agent_token") or None,
+            timeout=10.0,
+        )
+    if status != 200:
+        return None
+    cmd = data.get("command")
+    if not isinstance(cmd, dict):
+        return None
+    action = str(cmd.get("action") or "").lower()
+    if action in {"start", "stop"}:
+        return action
+    return None
+
+
+def remote_command_watcher(
+    cfg: dict[str, Any],
+    flag: dict[str, str | None],
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            action = poll_remote_command(cfg)
+            if action:
+                flag["action"] = action
+                print(f"[bridge] Remote command received: {action}")
+        except Exception:
+            pass
+        stop_event.wait(1.2)
 
 
 def reader_thread(stream, out_q: queue.Queue[str]) -> None:
@@ -450,19 +496,21 @@ def run_one_bot(
     argv: list[str] | str,
     use_shell: bool,
     display: str,
+    remote_flag: dict[str, str | None],
     *,
     first_start: bool,
 ) -> str:
     """
     Run smmod once.
-    Returns: "exited" | "stopped" (Ctrl+C stopped bot only)
+    Returns: "exited" | "stopped" (local Ctrl+C or remote stop)
     """
     if not first_start:
-        # Don't wipe site logs on mid-session restarts — only kill leftover PID
         prev = cfg.get("bot_pid")
         if prev:
             kill_pid_tree(int(prev))
         time.sleep(1.0)
+
+    remote_flag["action"] = None
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -496,14 +544,24 @@ def run_one_bot(
             f"[bridge] Started smmod PID {proc.pid}",
             f"[bridge] cwd={bot_dir}",
             f"[bridge] {display}",
-            "[bridge] Ctrl+C stops smmod only — then type start to run again.",
+            "[bridge] Ctrl+C or website Stop = stop smmod. Website Start / type start = run again.",
         ],
     )
-    print("[bridge] Running. Ctrl+C = stop smmod only (bridge stays up).\n")
+    print("[bridge] Running. Ctrl+C or website Stop = stop smmod only.\n")
+    heartbeat(cfg, bot_running=True)
 
     reason = "exited"
     try:
         while True:
+            # Remote stop from website
+            if remote_flag.get("action") == "stop":
+                remote_flag["action"] = None
+                print("\n[bridge] Website STOP — stopping smmod…")
+                kill_pid_tree(proc.pid)
+                push_lines(cfg, ["[bridge] smmod stopped (website Stop)."])
+                reason = "stopped"
+                break
+
             now = time.time()
             try:
                 while True:
@@ -518,8 +576,8 @@ def run_one_bot(
                 batch.clear()
                 last_push = now
 
-            if now - last_beat >= 8.0:
-                heartbeat(cfg)
+            if now - last_beat >= 5.0:
+                heartbeat(cfg, bot_running=True)
                 last_beat = now
 
             code = proc.poll()
@@ -540,7 +598,6 @@ def run_one_bot(
     except KeyboardInterrupt:
         print("\n[bridge] Ctrl+C — stopping smmod only…")
         kill_pid_tree(proc.pid)
-        # drain
         time.sleep(0.2)
         try:
             while True:
@@ -563,39 +620,72 @@ def run_one_bot(
             save_config(cfg)
         except Exception:
             pass
+        heartbeat(cfg, bot_running=False)
 
     return reason
 
 
-def wait_for_restart_command() -> str:
+def wait_for_restart_command(
+    cfg: dict[str, Any],
+    remote_flag: dict[str, str | None],
+) -> str:
     """
-    After smmod stops: Enter/start = run again, quit/exit = leave bridge.
-    Second Ctrl+C also quits the bridge.
+    After smmod stops: Enter/start / website Start = run again.
+    quit / Ctrl+C = leave bridge.
     """
     print()
     print("=" * 56)
     print("  smmod stopped.")
-    print("  start  /  Enter  → run smmod again")
-    print("  quit             → exit bridge")
-    print("  Ctrl+C           → exit bridge")
+    print("  start / Enter  → run smmod again")
+    print("  (or press Start on the website)")
+    print("  quit           → exit bridge")
     print("=" * 56)
-    try:
-        line = input("[bridge] > ").strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        print("\n[bridge] Exiting bridge.")
-        return "quit"
+    heartbeat(cfg, bot_running=False)
 
-    if line in {"", "start", "s", "run", "r", "restart"}:
-        return "start"
-    if line in {"quit", "q", "exit", "stop"}:
-        return "quit"
-    print(f"[bridge] Unknown command {line!r} — type start or quit.")
-    return wait_for_restart_command()
+    # Non-blocking-ish: poll remote + short timed input via thread
+    line_q: queue.Queue[str] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            line_q.put(input("[bridge] > "))
+        except (KeyboardInterrupt, EOFError):
+            line_q.put("__quit__")
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    while True:
+        if remote_flag.get("action") == "start":
+            remote_flag["action"] = None
+            print("[bridge] Website START — launching smmod…")
+            push_lines(cfg, ["[bridge] Restarting smmod (website Start)…"])
+            return "start"
+        if remote_flag.get("action") == "stop":
+            # already stopped
+            remote_flag["action"] = None
+
+        try:
+            line = line_q.get(timeout=0.4).strip().lower()
+        except queue.Empty:
+            heartbeat(cfg, bot_running=False)
+            continue
+
+        if line in {"__quit__"}:
+            print("\n[bridge] Exiting bridge.")
+            return "quit"
+        if line in {"", "start", "s", "run", "r", "restart"}:
+            return "start"
+        if line in {"quit", "q", "exit", "stop"}:
+            return "quit"
+        print(f"[bridge] Unknown {line!r} — type start or quit.")
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
 
 
 def run_command(cfg: dict[str, Any]) -> int:
     """
-    Keep the bridge alive. Ctrl+C only kills smmod; then you can `start` again.
+    Keep the bridge alive. Ctrl+C / website Stop only kills smmod.
+    Website Start or typing start runs it again.
     """
     cmd = str(cfg.get("command") or DEFAULT_CMD)
     bot_dir = resolve_bot_dir(cfg.get("bot_dir")) or find_smmod_dir() or Path.cwd()
@@ -625,9 +715,19 @@ def run_command(cfg: dict[str, Any]) -> int:
     print(f"[bridge] Bot folder: {bot_dir}")
     print(f"[bridge] Command: {display}")
     print(f"[bridge] Streaming to: {cfg['base_url']}")
-    print("[bridge] Ctrl+C stops smmod only. Type start to run it again.\n")
+    print("[bridge] Website Start/Stop + local Ctrl+C / start / quit\n")
+
+    remote_flag: dict[str, str | None] = {"action": None}
+    stop_watch = threading.Event()
+    watcher = threading.Thread(
+        target=remote_command_watcher,
+        args=(cfg, remote_flag, stop_watch),
+        daemon=True,
+    )
+    watcher.start()
 
     def _cleanup_atexit() -> None:
+        stop_watch.set()
         pid = cfg.get("bot_pid")
         if pid:
             kill_pid_tree(int(pid))
@@ -635,17 +735,29 @@ def run_command(cfg: dict[str, Any]) -> int:
     atexit.register(_cleanup_atexit)
 
     first = True
-    while True:
-        run_one_bot(cfg, bot_dir, argv, use_shell, display, first_start=first)
-        first = False
-        action = wait_for_restart_command()
-        if action == "quit":
-            push_lines(cfg, ["[bridge] Bridge exited."])
-            print("[bridge] Bye.")
-            return 0
-        print("[bridge] Starting smmod again…\n")
-        push_lines(cfg, ["[bridge] Restarting smmod…"])
-        time.sleep(1.0)
+    try:
+        while True:
+            run_one_bot(
+                cfg,
+                bot_dir,
+                argv,
+                use_shell,
+                display,
+                remote_flag,
+                first_start=first,
+            )
+            first = False
+            action = wait_for_restart_command(cfg, remote_flag)
+            if action == "quit":
+                push_lines(cfg, ["[bridge] Bridge exited."])
+                print("[bridge] Bye.")
+                return 0
+            print("[bridge] Starting smmod again…\n")
+            push_lines(cfg, ["[bridge] Restarting smmod…"])
+            time.sleep(1.0)
+    finally:
+        stop_watch.set()
+        heartbeat(cfg, bot_running=False)
 
 
 def main() -> int:

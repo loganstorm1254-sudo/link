@@ -20,6 +20,7 @@ export async function POST(req: NextRequest) {
     username?: string;
     password?: string;
     botLabel?: string;
+    botRunning?: boolean;
   } = {};
   try {
     body = await req.json();
@@ -61,6 +62,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  await touchHeartbeat(body.botLabel);
+  await touchHeartbeat(body.botLabel, body.botRunning);
   return NextResponse.json({ ok: true });
 }

@@ -11,6 +11,15 @@ export type LogLine = {
   text: string;
 };
 
+export type ControlAction = "start" | "stop";
+
+export type PendingCommand = {
+  id: string;
+  action: ControlAction;
+  createdAt: number;
+  by: string;
+};
+
 export type ConsoleState = {
   username: string;
   passwordHash: string; // scrypt encoded
@@ -20,6 +29,9 @@ export type ConsoleState = {
   lastHeartbeat: number;
   botLabel: string;
   claimedAt: number;
+  /** Bridge reports whether smmod process is running */
+  botRunning?: boolean;
+  pendingCommand?: PendingCommand | null;
 };
 
 /** Durable login from Vercel env (survives cold starts / multiple viewers). */
@@ -279,13 +291,64 @@ export async function appendLines(
   return state.lines.length;
 }
 
-export async function touchHeartbeat(botLabel?: string): Promise<boolean> {
+export async function touchHeartbeat(
+  botLabel?: string,
+  botRunning?: boolean
+): Promise<boolean> {
   const state = await loadState();
   if (!state) return false;
   state.lastHeartbeat = Date.now();
   if (botLabel?.trim()) state.botLabel = botLabel.trim();
+  if (typeof botRunning === "boolean") state.botRunning = botRunning;
   await saveState(state);
   return true;
+}
+
+export async function queueCommand(
+  action: ControlAction,
+  by: string
+): Promise<{ ok: true; command: PendingCommand } | { ok: false; error: string }> {
+  const state = await loadState();
+  if (!state) return { ok: false, error: "Console not linked. Start the bridge on the PC." };
+  if (!isOnline(state)) {
+    return { ok: false, error: "Bridge offline — open BeaconConsoleBridge.exe on the PC." };
+  }
+
+  if (action === "start" && state.botRunning) {
+    return { ok: false, error: "Bot is already running." };
+  }
+  if (action === "stop" && state.botRunning === false) {
+    return { ok: false, error: "Bot is already stopped." };
+  }
+
+  const command: PendingCommand = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    action,
+    createdAt: Date.now(),
+    by: normalizeUsername(by),
+  };
+  state.pendingCommand = command;
+  state.lines.push({
+    id: state.nextId++,
+    t: Date.now(),
+    text: `[beacon] Remote ${action.toUpperCase()} requested by ${command.by}`,
+  });
+  if (state.lines.length > MAX_LINES) {
+    state.lines = state.lines.slice(-MAX_LINES);
+  }
+  await saveState(state);
+  return { ok: true, command };
+}
+
+/** Bridge pulls the next command (clears it so it runs once). */
+export async function takePendingCommand(): Promise<PendingCommand | null> {
+  const state = await loadState();
+  if (!state?.pendingCommand) return null;
+  const cmd = state.pendingCommand;
+  state.pendingCommand = null;
+  state.lastHeartbeat = Date.now();
+  await saveState(state);
+  return cmd;
 }
 
 export function isOnline(state: ConsoleState | null): boolean {

@@ -26,6 +26,8 @@ export async function GET(req: NextRequest) {
     username: state.username,
     botLabel: state.botLabel,
     online: isOnline(state),
+    botRunning: Boolean(state.botRunning),
+    pendingCommand: state.pendingCommand || null,
     lastHeartbeat: state.lastHeartbeat,
     lines,
   });
